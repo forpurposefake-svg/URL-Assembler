@@ -1,0 +1,421 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Generate Android Project & Native Fetch Bridge
+        run: |
+          mkdir -p app/src/main/java/com/assembler/app
+          mkdir -p app/src/main/assets
+
+          cat << 'EOF' > settings.gradle
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "URLContentAssembler"
+          include ':app'
+          EOF
+
+          cat << 'EOF' > app/build.gradle
+          plugins {
+              id 'com.android.application' version '8.3.2'
+          }
+
+          android {
+              namespace 'com.assembler.app'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.assembler.app"
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:label="URL Assembler"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/assembler/app/MainActivity.java
+          package com.assembler.app;
+
+          import android.app.Activity;
+          import android.content.ClipData;
+          import android.content.ClipboardManager;
+          import android.content.Context;
+          import android.os.Bundle;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          import java.io.BufferedReader;
+          import java.io.InputStream;
+          import java.io.InputStreamReader;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.nio.charset.StandardCharsets;
+
+          public class MainActivity extends Activity {
+              private WebView webView;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  webView = new WebView(this);
+                  WebSettings settings = webView.getSettings();
+                  settings.setJavaScriptEnabled(true);
+                  settings.setDomStorageEnabled(true);
+
+                  webView.setWebViewClient(new WebViewClient());
+                  webView.addJavascriptInterface(new NativeBridge(this), "AndroidBridge");
+                  setContentView(webView);
+                  webView.loadUrl("file:///android_asset/index.html");
+              }
+
+              public static class NativeBridge {
+                  private final Context context;
+
+                  NativeBridge(Context context) {
+                      this.context = context;
+                  }
+
+                  @JavascriptInterface
+                  public String fetchUrl(String targetUrl) {
+                      HttpURLConnection conn = null;
+                      try {
+                          String currentUrl = targetUrl;
+                          for (int redirects = 0; redirects < 5; redirects++) {
+                              URL url = new URL(currentUrl);
+                              conn = (HttpURLConnection) url.openConnection();
+                              conn.setInstanceFollowRedirects(true);
+                              conn.setConnectTimeout(15000);
+                              conn.setReadTimeout(15000);
+                              conn.setRequestMethod("GET");
+                              conn.setRequestProperty("User-Agent",
+                                  "Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36");
+                              conn.setRequestProperty("Accept",
+                                  "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+                              conn.setRequestProperty("Accept-Language", "en-US,en;q=0.9");
+
+                              int status = conn.getResponseCode();
+                              if (status == HttpURLConnection.HTTP_MOVED_TEMP ||
+                                  status == HttpURLConnection.HTTP_MOVED_PERM ||
+                                  status == 307 || status == 308) {
+                                  String location = conn.getHeaderField("Location");
+                                  conn.disconnect();
+                                  currentUrl = new URL(url, location).toExternalForm();
+                                  continue;
+                              }
+
+                              if (status < 200 || status >= 300) {
+                                  return "ERROR:HTTP " + status;
+                              }
+
+                              InputStream in = conn.getInputStream();
+                              BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
+                              StringBuilder sb = new StringBuilder();
+                              String line;
+                              while ((line = reader.readLine()) != null) {
+                                  sb.append(line).append("\n");
+                              }
+                              reader.close();
+                              return sb.toString();
+                          }
+                          return "ERROR:Too many redirects";
+                      } catch (Exception e) {
+                          return "ERROR:" + e.getMessage();
+                      } finally {
+                          if (conn != null) conn.disconnect();
+                      }
+                  }
+
+                  @JavascriptInterface
+                  public boolean copyText(String text) {
+                      try {
+                          ClipboardManager clipboard = (ClipboardManager) context.getSystemService(Context.CLIPBOARD_SERVICE);
+                          ClipData clip = ClipData.newPlainText("Assembled Output", text);
+                          clipboard.setPrimaryClip(clip);
+                          return true;
+                      } catch (Exception e) {
+                          return false;
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/assets/index.html
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+          <title>URL Content Assembler</title>
+          <style>
+            :root {
+              --bg:#0d0f14; --panel:#151920; --panel-2:#1b202a; --border:#272e3b;
+              --text:#e6eaf2; --muted:#8b95a8; --accent:#6d8cff; --ok:#3ecf8e;
+              --err:#ff7b7b; --warn:#f0b429; --radius:14px;
+            }
+            * { box-sizing:border-box; }
+            body {
+              margin:0; padding:20px 14px 56px; background:var(--bg); color:var(--text);
+              font-family:system-ui, -apple-system, sans-serif; line-height:1.5;
+            }
+            .app { max-width:680px; margin:0 auto; display:flex; flex-direction:column; gap:14px; }
+            header h1 { margin:0; font-size:1.35rem; }
+            header p { margin:4px 0 0; color:var(--muted); font-size:.86rem; }
+            .card {
+              background:var(--panel); border:1px solid var(--border);
+              border-radius:var(--radius); padding:14px; display:flex; flex-direction:column; gap:12px;
+            }
+            .url-block + .url-block { padding-top:12px; border-top:1px dashed var(--border); }
+            .field { display:flex; flex-direction:column; gap:5px; }
+            label { font-size:.72rem; font-weight:700; text-transform:uppercase; color:var(--muted); }
+            input[type="url"], textarea {
+              width:100%; background:var(--panel-2); color:var(--text);
+              border:1px solid var(--border); border-radius:10px; padding:10px 12px;
+              font:inherit; font-size:.92rem; outline:none;
+            }
+            textarea { resize:vertical; min-height:80px; }
+            details.manual summary { cursor:pointer; font-size:.78rem; color:var(--muted); padding:4px 0; }
+            details.manual textarea { margin-top:6px; font-size:.82rem; }
+            .btn {
+              border:1px solid var(--border); background:var(--panel-2); color:var(--text);
+              padding:12px 16px; border-radius:10px; font:inherit; font-size:.92rem;
+              font-weight:600; cursor:pointer; width:100%;
+            }
+            .btn-primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+            .status { font-size:.84rem; color:var(--muted); text-align:center; min-height:1.2em; }
+            .status.ok { color:var(--ok); } .status.error { color:var(--err); }
+            .status.warn { color:var(--warn); } .status.busy { color:var(--accent); }
+            .output-head { display:flex; align-items:center; justify-content:space-between; }
+            #output { min-height:280px; font-family:monospace; font-size:.82rem; white-space:pre-wrap; }
+          </style>
+          </head>
+          <body>
+          <main class="app">
+            <header>
+              <h1>URL Content Assembler</h1>
+              <p>Native Android Engine — Direct IP fetching with zero proxies.</p>
+            </header>
+
+            <section class="card">
+              <div class="url-block">
+                <div class="field">
+                  <label for="url1">Website 1</label>
+                  <input type="url" id="url1" placeholder="https://example.com/article">
+                </div>
+                <details class="manual">
+                  <summary>Paste content manually</summary>
+                  <textarea id="manual1" placeholder="Paste text here if needed..."></textarea>
+                </details>
+              </div>
+              <div class="url-block">
+                <div class="field">
+                  <label for="url2">Website 2</label>
+                  <input type="url" id="url2" placeholder="https://example.com/article">
+                </div>
+                <details class="manual">
+                  <summary>Paste content manually</summary>
+                  <textarea id="manual2" placeholder="Paste text here if needed..."></textarea>
+                </details>
+              </div>
+              <div class="url-block">
+                <div class="field">
+                  <label for="url3">Website 3</label>
+                  <input type="url" id="url3" placeholder="https://example.com/article">
+                </div>
+                <details class="manual">
+                  <summary>Paste content manually</summary>
+                  <textarea id="manual3" placeholder="Paste text here if needed..."></textarea>
+                </details>
+              </div>
+            </section>
+
+            <button class="btn btn-primary" id="fetchBtn" type="button">Fetch and Assemble</button>
+            <div class="status" id="status"></div>
+
+            <section class="card">
+              <div class="field">
+                <label for="prompt">Specific Prompt</label>
+                <textarea id="prompt" rows="3" placeholder="e.g. Track updates from 6hrs to now..."></textarea>
+              </div>
+            </section>
+
+            <section class="card">
+              <div class="output-head">
+                <label for="output">Combined Output</label>
+                <button class="btn" id="copyBtn" type="button" style="width:auto; padding:6px 14px; font-size:.82rem;">Copy</button>
+              </div>
+              <textarea id="output" readonly placeholder="Your assembled text will appear here..."></textarea>
+            </section>
+          </main>
+
+          <script>
+          (function () {
+            const $ = (id) => document.getElementById(id);
+            const urlInputs = [$('url1'), $('url2'),$('url3')];
+            const manualInputs = [$('manual1'), $('manual2'),$('manual3')];
+            const promptEl = $('prompt');
+            const outputEl = $('output');
+            const fetchBtn = $('fetchBtn');
+            const copyBtn = $('copyBtn');
+            const statusEl = $('status');
+
+            const STRIP_SELECTOR = 'script,style,noscript,iframe,svg,canvas,form,button,nav,aside,footer,header,[role="navigation"],[aria-hidden="true"]';
+            const BLOCK_TAGS = new Set(['ARTICLE','BLOCKQUOTE','DIV','H1','H2','H3','H4','LI','MAIN','P','PRE','SECTION','TR']);
+
+            function collectText(node, out) {
+              for (const child of node.childNodes) {
+                if (child.nodeType === 3) out.push(child.nodeValue);
+                else if (child.nodeType === 1) {
+                  if (child.tagName === 'BR') { out.push('\n'); continue; }
+                  const isBlock = BLOCK_TAGS.has(child.tagName);
+                  if (isBlock) out.push('\n');
+                  collectText(child, out);
+                  if (isBlock) out.push('\n');
+                }
+              }
+            }
+
+            function extractText(html) {
+              const doc = new DOMParser().parseFromString(html, 'text/html');
+              doc.querySelectorAll(STRIP_SELECTOR).forEach((el) => el.remove());
+              const root = doc.querySelector('article') || doc.querySelector('[itemprop="articleBody"]') || doc.querySelector('main') || doc.body;
+              if (!root) return '';
+              const parts = [];
+              collectText(root, parts);
+              return parts.join('')
+                .replace(/\r/g, '')
+                .replace(/[\t\f\v\u00a0 ]+/g, ' ')
+                .split('\n')
+                .map((l) => l.trim())
+                .filter((l, i, a) => l.length > 0 || (i > 0 && a[i - 1].length > 0))
+                .join('\n')
+                .trim()
+                .slice(0, 40000);
+            }
+
+            function processSlot(index) {
+              const url = urlInputs[index].value.trim();
+              const manual = manualInputs[index].value.trim();
+              const label = `--- Website ${index + 1} ---`;
+
+              if (!url && !manual) return null;
+              if (manual) return { ok: true, text: `${label}\n\n\n${manual}` };
+
+              let normalized;
+              try {
+                normalized = new URL(/^https?:\/\//i.test(url) ? url : 'https://' + url).href;
+              } catch (e) {
+                return { ok: false, text: `${label}\n[Invalid URL: ${url}]` };
+              }
+
+              const raw = window.AndroidBridge.fetchUrl(normalized);
+              if (raw.startsWith('ERROR:')) {
+                manualInputs[index].closest('details').open = true;
+                return { ok: false, text: `${label}\n${normalized}\n\n[Could not fetch — ${raw.slice(6)}]` };
+              }
+
+              const clean = extractText(raw);
+              if (!clean || clean.length < 30) {
+                return { ok: false, text: `${label}\n${normalized}\n\n[No readable article text found]` };
+              }
+              return { ok: true, text: `${label}\n${normalized}\n\n${clean}` };
+            }
+
+            fetchBtn.addEventListener('click', () => {
+              fetchBtn.disabled = true;
+              statusEl.textContent = 'Fetching directly via Android network...';
+              statusEl.className = 'status busy';
+
+              setTimeout(() => {
+                const results = [0, 1, 2].map(processSlot);
+                const sections = results.filter(Boolean).map((r) => r.text);
+                sections.push(`--- Specific Prompt ---\n\n${promptEl.value.trim() || '(no prompt entered)'}`);
+                outputEl.value = sections.join('\n\n\n');
+                fetchBtn.disabled = false;
+
+                const failed = results.filter((r) => r && !r.ok).length;
+                statusEl.textContent = failed ? `Completed with ${failed} failed fetch(es).` : 'Done!';
+                statusEl.className = failed ? 'status warn' : 'status ok';
+              }, 50);
+            });
+
+            copyBtn.addEventListener('click', () => {
+              if (!outputEl.value) return;
+              window.AndroidBridge.copyText(outputEl.value);
+              copyBtn.textContent = 'Copied!';
+              setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1500);
+            });
+          })();
+          </script>
+          </body>
+          </html>
+          EOF
+
+      - name: Build Debug APK
+        run: gradle assembleDebug
+
+      - name: Upload Compiled APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: url-content-assembler-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
